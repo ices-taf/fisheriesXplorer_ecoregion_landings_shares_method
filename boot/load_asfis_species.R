@@ -23,13 +23,6 @@
 #' head(species)
 #' }
 #'
-# load_asfis_species <- function() {
-# #   url <- "http://www.fao.org/fishery/static/ASFIS/ASFIS_sp_2026.1.zip"
-#     species <- read.csv("./Boot/ASFIS_sp_2026.1.csv", na.strings = "", stringsAsFactors = FALSE)
-#     species <- dplyr::select(species, English_name, Scientific_Name, Alpha3_Code)
-#     return(species)
-# }
-
 load_asfis_species <- function() {
 
   # 1. Define the FAO URL
@@ -87,3 +80,14 @@ load_asfis_species <- function() {
 
   return(species)
 }
+
+
+# 8. Execute function and save TAF boot output
+species <- load_asfis_species()
+
+write.csv(
+  species,
+  file = "./boot/ASFIS_species.csv",
+  row.names = FALSE,
+  na = ""
+)
