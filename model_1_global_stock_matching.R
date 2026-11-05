@@ -187,6 +187,104 @@ union_geometry <- function(x) {
 }
 
 
+# Read current ICES GIS layers.
+# Used only for Nephrops in the hybrid workflow.
+read_gis <- function(layer, where = "1=1") {
+
+  url <- paste0(
+    "https://gis.ices.dk/gis/rest/services/ICES_reference_layers/",
+    layer,
+    "/query"
+  )
+
+  response <- httr::GET(
+    url,
+    query = list(
+      where = where,
+      returnIdsOnly = "true",
+      f = "json"
+    ),
+    httr::timeout(180)
+  )
+
+  httr::stop_for_status(response)
+
+  info <- jsonlite::fromJSON(
+    httr::content(
+      response,
+      "text",
+      encoding = "UTF-8"
+    )
+  )
+
+  if (
+    !is.null(info$error) ||
+    is.null(info$objectIdFieldName)
+  ) {
+    stop("GIS ID query failed: ", layer)
+  }
+
+  ids <- info$objectIds
+
+  if (!length(ids)) {
+    return(
+      st_sf(
+        geometry = st_sfc(crs = 3857)
+      )
+    )
+  }
+
+  pages <- lapply(
+    split(
+      ids,
+      ceiling(seq_along(ids) / 100)
+    ),
+    function(wanted) {
+
+      path <- tempfile(
+        fileext = ".geojson"
+      )
+
+      on.exit(
+        unlink(path)
+      )
+
+      r <- httr::GET(
+        url,
+        query = list(
+          objectIds = paste(
+            wanted,
+            collapse = ","
+          ),
+          outFields = "*",
+          outSR = 3857,
+          f = "geojson"
+        ),
+        httr::timeout(180),
+        httr::write_disk(path)
+      )
+
+      httr::stop_for_status(r)
+
+      x <- st_read(
+        path,
+        quiet = TRUE
+      )
+
+      stopifnot(
+        nrow(x) == length(wanted)
+      )
+
+      normalise(x)
+    }
+  )
+
+  do.call(
+    rbind,
+    pages
+  )
+}
+
 # Used only for rectangle-vs-Nephrops-FU geometry.
 relation_vec <- function(
   support,
@@ -1529,12 +1627,29 @@ write.csv(
 )
 
 
-# 6. Nephrops Functional Units: rectangle geometry only ---------------------
+# 6. Nephrops Functional Units ---------------------------------------------
+#
+# Ordinary stocks use the simplified rectangle/ICES-area method.
+#
+# Nephrops deliberately retains the validated baseline spatial treatment:
+#
+# reported ICES area ∩ statistical rectangle
+#                     ↓
+#             geographic support
+#                     ↓
+#          Nephrops FU polygon
+#
+# This is required because Nephrops Functional Units do not correspond
+# directly to ordinary ICES area codes.
 
 message(
-  "[4/8] Preparing Nephrops Functional Unit rectangle lookup"
+  "[4/8] Preparing Nephrops Functional Units using baseline spatial method"
 )
 
+
+# -------------------------------------------------------------------------
+# 6a. Identify Nephrops stocks and RDBES locations
+# -------------------------------------------------------------------------
 
 single_fu <- c(
   5:17,
@@ -1561,44 +1676,255 @@ fu_key <- bind_rows(
   tribble(
     ~fu_no, ~fishstock,
 
-    "4outFU",
-    "nep.27.4outFU",
+    "4outFU", "nep.27.4outFU",
+    "6aoutFU", "nep.27.6aoutFU",
+    "7outFU", "nep.27.7outFU",
 
-    "6aoutFU",
-    "nep.27.6aoutFU",
+    "FU3", "nep.fu.3-4",
+    "FU4", "nep.fu.3-4",
 
-    "7outFU",
-    "nep.27.7outFU",
+    "FU2021", "nep.fu.2021",
 
-    "FU3",
-    "nep.fu.3-4",
+    "FU23", "nep.fu.2324",
+    "FU24", "nep.fu.2324",
 
-    "FU4",
-    "nep.fu.3-4",
+    "FU26", "nep.fu.2627",
+    "FU27", "nep.fu.2627",
 
-    "FU2021",
-    "nep.fu.2021",
-
-    "FU23",
-    "nep.fu.2324",
-
-    "FU24",
-    "nep.fu.2324",
-
-    "FU26",
-    "nep.fu.2627",
-
-    "FU27",
-    "nep.fu.2627",
-
-    "FU28",
-    "nep.fu.2829",
-
-    "FU29",
-    "nep.fu.2829"
+    "FU28", "nep.fu.2829",
+    "FU29", "nep.fu.2829"
   )
 )
 
+
+nep_aphia <- unique(
+  stock_species$aphia[
+    startsWith(
+      stock_species$fishstock,
+      "nep."
+    )
+  ]
+)
+
+
+nep_geography <- dat |>
+  filter(
+    aphia %in% nep_aphia
+  ) |>
+  distinct(
+    CLarea,
+    CLstatisticalRectangle
+  ) |>
+  mutate(
+    nep_geo_id = row_number()
+  )
+
+
+message(
+  "  Nephrops: ",
+  nrow(nep_geography),
+  " distinct reported area/rectangle locations"
+)
+
+
+# -------------------------------------------------------------------------
+# 6b. Load current ICES area polygons
+# -------------------------------------------------------------------------
+
+areas <- cached(
+  "areas",
+  read_gis(
+    "ICES_Areas/MapServer/0"
+  )
+)
+
+
+nep_area_codes <- unique(
+  na.omit(
+    nep_geography$CLarea
+  )
+)
+
+
+nep_atomic_parts <- setNames(
+  lapply(
+    nep_area_codes,
+    function(a) {
+
+      which(
+        areas$Area_Full == a |
+          startsWith(
+            areas$Area_Full,
+            paste0(a, ".")
+          )
+      )
+    }
+  ),
+  nep_area_codes
+)
+
+
+nep_area_polygons <- lapply(
+  nep_atomic_parts,
+  function(i) {
+
+    if (!length(i)) {
+      return(empty)
+    }
+
+    union_geometry(
+      areas[i, ]
+    )
+  }
+)
+
+
+# -------------------------------------------------------------------------
+# 6c. Load only statistical rectangles needed by Nephrops
+# -------------------------------------------------------------------------
+
+fu25_rectangles <- c(
+  "15E0",
+  "15E1",
+  "16E0",
+  "16E1",
+  "17E1"
+)
+
+
+nep_rectangle_ids <- sort(
+  unique(
+    na.omit(
+      c(
+        nep_geography$CLstatisticalRectangle,
+        fu25_rectangles
+      )
+    )
+  )
+)
+
+
+# Reuse rectangles already downloaded by the baseline workflow whenever
+# possible.
+
+rectangle_cache_files <- list.files(
+  cache_dir,
+  "^rectangles_[0-9]+[.]rds$",
+  full.names = TRUE
+)
+
+
+rectangle_pool <- if (
+  !refresh_reference &&
+  length(rectangle_cache_files)
+) {
+
+  do.call(
+    rbind,
+    lapply(
+      rectangle_cache_files,
+      function(path) {
+        readRDS(path)$data
+      }
+    )
+  )
+
+} else {
+
+  NULL
+}
+
+
+if (!is.null(rectangle_pool)) {
+
+  rectangle_pool <-
+    rectangle_pool[
+      !duplicated(
+        rectangle_pool$ICESNAME
+      ),
+    ]
+}
+
+
+if (
+  !is.null(rectangle_pool) &&
+  all(
+    nep_rectangle_ids %in%
+      rectangle_pool$ICESNAME
+  )
+) {
+
+  message(
+    "  Reusing cached ICES rectangle polygons for Nephrops"
+  )
+
+  nep_rectangles <- rectangle_pool[
+    match(
+      nep_rectangle_ids,
+      rectangle_pool$ICESNAME
+    ),
+  ]
+
+} else {
+
+  message(
+    "  Downloading ",
+    length(nep_rectangle_ids),
+    " ICES rectangle polygons needed for Nephrops"
+  )
+
+  rectangle_batches <- split(
+    nep_rectangle_ids,
+    ceiling(
+      seq_along(nep_rectangle_ids) / 100
+    )
+  )
+
+
+  nep_rectangles <- do.call(
+    rbind,
+    lapply(
+      rectangle_batches,
+      function(ids) {
+
+        read_gis(
+          "ICES_Statrec_complete/MapServer/0",
+          paste0(
+            "ICESNAME IN ('",
+            paste(
+              gsub(
+                "'",
+                "''",
+                ids
+              ),
+              collapse = "','"
+            ),
+            "')"
+          )
+        )
+      }
+    )
+  )
+}
+
+
+rm(rectangle_pool)
+
+
+stopifnot(
+  !anyDuplicated(
+    nep_rectangles$ICESNAME
+  ),
+  all(
+    fu25_rectangles %in%
+      nep_rectangles$ICESNAME
+  )
+)
+
+
+# -------------------------------------------------------------------------
+# 6d. Prepare Nephrops FU polygons
+# -------------------------------------------------------------------------
 
 nephrops_fu <- normalise(
   st_read(
@@ -1627,49 +1953,7 @@ stopifnot(
 )
 
 
-# Use the same accepted FU25 five-rectangle correction as the baseline,
-# but build it from the local static rectangle geometries rather than
-# live GIS.
-
-fu25_rectangles <- c(
-  "15E0",
-  "15E1",
-  "16E0",
-  "16E1",
-  "17E1"
-)
-
-
-statrec_map_norm <- normalise(
-  statrec_map
-)
-
-
-fu25_idx <- match(
-  fu25_rectangles,
-  statrec_map_norm$ICESNAME
-)
-
-
-if (
-  anyNA(
-    fu25_idx
-  )
-) {
-
-  stop(
-    "FU25 correction rectangles missing from static map: ",
-    paste(
-      fu25_rectangles[
-        is.na(
-          fu25_idx
-        )
-      ],
-      collapse = ", "
-    )
-  )
-}
-
+# Same accepted FU25 correction used in the validated baseline.
 
 st_geometry(
   nephrops_fu
@@ -1677,8 +1961,11 @@ st_geometry(
   nephrops_fu$fu_no ==
     "FU25"
 ] <- union_geometry(
-  statrec_map_norm[
-    fu25_idx,
+  nep_rectangles[
+    match(
+      fu25_rectangles,
+      nep_rectangles$ICESNAME
+    ),
   ]
 )
 
@@ -1693,9 +1980,7 @@ nephrops_fu <- left_join(
 
 nephrops_unmapped <- filter(
   nephrops_fu,
-  is.na(
-    fishstock
-  )
+  is.na(fishstock)
 ) |>
   st_drop_geometry()
 
@@ -1741,100 +2026,263 @@ nephrops$complete <- vapply(
 )
 
 
-nep_aphia <- unique(
-  stock_species$aphia[
-    startsWith(
-      stock_species$fishstock,
-      "nep."
-    )
-  ]
+# -------------------------------------------------------------------------
+# 6e. Build the same area ∩ rectangle support used by baseline
+# -------------------------------------------------------------------------
+
+nep_support <- rep(
+  list(empty),
+  nrow(nep_geography)
 )
 
 
-nep_rect_ids <- sort(
-  unique(
-    na.omit(
-      dat$CLstatisticalRectangle[
-        dat$aphia %in%
-          nep_aphia
+nep_geography$geography_status <-
+  "unknown"
+
+
+nep_area_groups <- split(
+  seq_len(
+    nrow(nep_geography)
+  ),
+  match(
+    nep_geography$CLarea,
+    unique(
+      nep_geography$CLarea
+    )
+  )
+)
+
+
+for (ids in nep_area_groups) {
+
+  area_name <-
+    nep_geography$CLarea[
+      ids[1]
+    ]
+
+
+  a <- nep_area_polygons[[area_name]]
+
+
+  if (
+    is.null(a)
+  ) {
+    a <- empty
+  }
+
+
+  r <- match(
+    nep_geography$CLstatisticalRectangle[
+      ids
+    ],
+    nep_rectangles$ICESNAME
+  )
+
+
+  # Area exists but rectangle is missing:
+  # baseline uses the reported ICES area alone.
+
+  if (
+    !st_is_empty(a)
+  ) {
+
+    missing_rectangle <- ids[
+      is.na(r)
+    ]
+
+    if (
+      length(
+        missing_rectangle
+      )
+    ) {
+
+      nep_support[
+        missing_rectangle
+      ] <- rep(
+        list(a),
+        length(
+          missing_rectangle
+        )
+      )
+    }
+
+    nep_geography$geography_status[
+      ids
+    ] <- ifelse(
+      is.na(r),
+      "area_only",
+      "area_rectangle_conflict"
+    )
+  }
+
+
+  has_r <- which(
+    !is.na(r)
+  )
+
+
+  if (!length(has_r)) {
+    next
+  }
+
+
+  # If an ICES area is available, intersect the rectangle with it.
+  # Otherwise use the rectangle against all ICES-area polygons.
+
+  target <- if (
+    !st_is_empty(a)
+  ) {
+
+    a
+
+  } else {
+
+    st_geometry(
+      areas
+    )
+  }
+
+
+  cut <- suppressWarnings(
+    st_intersection(
+      st_geometry(
+        nep_rectangles
+      )[
+        r[has_r]
+      ],
+      target
+    )
+  )
+
+
+  if (!length(cut)) {
+    next
+  }
+
+
+  pieces <- split(
+    seq_along(cut),
+    attr(
+      cut,
+      "idx"
+    )[, 1L]
+  )
+
+
+  for (
+    key in names(pieces)
+  ) {
+
+    g <- union_geometry(
+      cut[
+        pieces[[key]]
       ]
     )
-  )
+
+
+    if (
+      sum(
+        as.numeric(
+          st_area(g)
+        )
+      ) <= 0
+    ) {
+      next
+    }
+
+
+    i <- ids[
+      has_r[
+        as.integer(key)
+      ]
+    ]
+
+
+    nep_support[[i]] <- g
+
+
+    nep_geography$geography_status[i] <-
+      if (
+        !st_is_empty(a)
+      ) {
+
+        "area_and_rectangle"
+
+      } else {
+
+        "rectangle_only"
+      }
+  }
+}
+
+
+nep_support_sfc <- do.call(
+  c,
+  nep_support
 )
 
 
-nep_rect_sf <- statrec_map_norm[
-  match(
-    nep_rect_ids,
-    statrec_map_norm$ICESNAME
-  ),
-]
-
-
-nep_rect_sf <- nep_rect_sf[
-  !is.na(
-    nep_rect_sf$ICESNAME
-  ),
-]
-
-
-nep_evidence <- if (
-  nrow(
-    nep_rect_sf
-  )
-) {
-
-  bind_rows(
-    lapply(
-      nephrops$fishstock,
-      function(s) {
-
-        k <- match(
-          s,
-          nephrops$fishstock
-        )
-
-        z <- relation_vec(
-          nep_rect_sf,
-          st_geometry(
-            nephrops
-          )[k]
-        )
-
-        if (
-          !isTRUE(
-            nephrops$complete[k]
-          )
-        ) {
-
-          z[
-            z == "outside"
-          ] <- "unknown"
-        }
-
-        tibble(
-          CLstatisticalRectangle =
-            as.character(
-              nep_rect_sf$ICESNAME
-            ),
-          fishstock = s,
-          evidence = z
-        )
-      }
+stopifnot(
+  length(
+    nep_support_sfc
+  ) ==
+    nrow(
+      nep_geography
     )
-  )
+)
 
-} else {
 
-  tibble(
-    CLstatisticalRectangle =
-      character(),
-    fishstock =
-      character(),
-    evidence =
-      character()
+# -------------------------------------------------------------------------
+# 6f. Compare each precise support with each Nephrops FU
+# -------------------------------------------------------------------------
+
+nep_evidence <- bind_rows(
+  lapply(
+    nephrops$fishstock,
+    function(s) {
+
+      k <- match(
+        s,
+        nephrops$fishstock
+      )
+
+
+      z <- relation_vec(
+        nep_support_sfc,
+        st_geometry(
+          nephrops
+        )[k]
+      )
+
+
+      # Preserve conservative baseline treatment for incomplete FU maps.
+
+      if (
+        !isTRUE(
+          nephrops$complete[k]
+        )
+      ) {
+
+        z[
+          z == "outside"
+        ] <- "unknown"
+      }
+
+
+      tibble(
+        CLarea =
+          nep_geography$CLarea,
+
+        CLstatisticalRectangle =
+          nep_geography$CLstatisticalRectangle,
+
+        fishstock = s,
+
+        evidence = z
+      )
+    }
   )
-}
+)
 
 
 write.csv(
@@ -1845,7 +2293,18 @@ write.csv(
   ),
   file.path(
     diagnostic_dir,
-    "nephrops_rectangle_candidate_evidence.csv"
+    "nephrops_location_candidate_evidence.csv"
+  ),
+  row.names = FALSE
+)
+
+
+write.csv(
+  nep_geography |>
+    st_drop_geometry(),
+  file.path(
+    diagnostic_dir,
+    "nephrops_location_resolution.csv"
   ),
   row.names = FALSE
 )
@@ -1988,37 +2447,59 @@ rules$evidence <- vapply(
     # to the FU polygon.
 
     if (
-      startsWith(
-        s,
-        "nep."
-      )
-    ) {
+  startsWith(
+    s,
+    "nep."
+  )
+) {
 
-      if (
-        is.na(
-          rec
-        )
-      ) {
-        return("unknown")
-      }
+  same_area <-
+    (
+      is.na(nep_evidence$CLarea) &
+        is.na(reported_area)
+    ) |
+    (
+      !is.na(nep_evidence$CLarea) &
+        !is.na(reported_area) &
+        nep_evidence$CLarea ==
+        reported_area
+    )
 
-      k <- which(
+
+  same_rectangle <-
+    (
+      is.na(
+        nep_evidence$CLstatisticalRectangle
+      ) &
+        is.na(rec)
+    ) |
+    (
+      !is.na(
+        nep_evidence$CLstatisticalRectangle
+      ) &
+        !is.na(rec) &
         nep_evidence$CLstatisticalRectangle ==
-          rec &
-          nep_evidence$fishstock ==
-          s
-      )
+        rec
+    )
 
-      if (
-        !length(k)
-      ) {
-        return("unknown")
-      }
 
-      return(
-        nep_evidence$evidence[k[1]]
-      )
-    }
+  k <- which(
+    nep_evidence$fishstock ==
+      s &
+      same_area &
+      same_rectangle
+  )
+
+
+  if (!length(k)) {
+    return("unknown")
+  }
+
+
+  return(
+    nep_evidence$evidence[k[1]]
+  )
+}
 
 
     # Sandeel assessment areas are not ordinary ICES_Area stock
