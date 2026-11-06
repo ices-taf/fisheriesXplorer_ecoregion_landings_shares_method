@@ -12,6 +12,9 @@
 #     rectangle -> ICES-area mapping in boot/initial/data.
 #   - Reported CLarea is used to disambiguate rectangles that cross area
 #     boundaries and as a fallback when the rectangle is unavailable.
+#   - If rectangle and CLarea conflict, both sources are evaluated independently
+#     against ordinary stocks; a conclusion is retained only when both sources
+#     imply the same stock-level evidence.
 #   - Geometry is retained only for Nephrops Functional Units, which cannot be
 #     represented by ordinary ICES area codes alone.
 #   - No ecoregion share is calculated here; model_2 is unchanged.
@@ -2326,14 +2329,14 @@ needs_review <- c(
   "cap.27.2a514",
 
   "pra.27.4a",
-  "pra.27.3a4a",
+  # "pra.27.3a4a",
 
   "her.27.nirs",
-  "her.27.irls",
+  # "her.27.irls",
   "her.27.6aN",
-  "her.27.6aS7bc",
-  "her.27.20-24",
-  "her.27.3a47d",
+  # "her.27.6aS7bc",
+  # "her.27.20-24",
+  # "her.27.3a47d",
   "her.27.1-24a514a",
   "her.27.5a",
 
@@ -2353,7 +2356,7 @@ needs_review <- c(
   "seh.27.1",
   "seh.27.125a14",
 
-  "cyo.27.nea",
+  # "cyo.27.nea",
   "guq.27.nea"
 )
 
@@ -2401,6 +2404,12 @@ reported_area_by_geo <- setNames(
 )
 
 
+geography_status_by_geo <- setNames(
+  geography$geography_status,
+  geography$geo_id
+)
+
+
 rules <- dat |>
   distinct(
     geo_id,
@@ -2418,7 +2427,7 @@ rules <- dat |>
   )
 
 
-rules$evidence <- vapply(
+rules$raw_evidence <- vapply(
   seq_len(
     nrow(
       rules
@@ -2443,70 +2452,67 @@ rules$evidence <- vapply(
 
 
     # Nephrops is the only stock family still using geometry.
-    # Evidence is based on the whole statistical rectangle relative
-    # to the FU polygon.
+    # Preserve the underlying FU evidence before any review override.
 
     if (
-  startsWith(
-    s,
-    "nep."
-  )
-) {
+      startsWith(
+        s,
+        "nep."
+      )
+    ) {
 
-  same_area <-
-    (
-      is.na(nep_evidence$CLarea) &
-        is.na(reported_area)
-    ) |
-    (
-      !is.na(nep_evidence$CLarea) &
-        !is.na(reported_area) &
-        nep_evidence$CLarea ==
-        reported_area
-    )
-
-
-  same_rectangle <-
-    (
-      is.na(
-        nep_evidence$CLstatisticalRectangle
-      ) &
-        is.na(rec)
-    ) |
-    (
-      !is.na(
-        nep_evidence$CLstatisticalRectangle
-      ) &
-        !is.na(rec) &
-        nep_evidence$CLstatisticalRectangle ==
-        rec
-    )
+      same_area <-
+        (
+          is.na(nep_evidence$CLarea) &
+            is.na(reported_area)
+        ) |
+        (
+          !is.na(nep_evidence$CLarea) &
+            !is.na(reported_area) &
+            nep_evidence$CLarea ==
+            reported_area
+        )
 
 
-  k <- which(
-    nep_evidence$fishstock ==
-      s &
-      same_area &
-      same_rectangle
-  )
+      same_rectangle <-
+        (
+          is.na(
+            nep_evidence$CLstatisticalRectangle
+          ) &
+            is.na(rec)
+        ) |
+        (
+          !is.na(
+            nep_evidence$CLstatisticalRectangle
+          ) &
+            !is.na(rec) &
+            nep_evidence$CLstatisticalRectangle ==
+            rec
+        )
 
 
-  if (!length(k)) {
-    return("unknown")
-  }
+      k <- which(
+        nep_evidence$fishstock ==
+          s &
+          same_area &
+          same_rectangle
+      )
 
 
-  return(
-    nep_evidence$evidence[k[1]]
-  )
-}
+      if (!length(k)) {
+        return("unknown")
+      }
+
+
+      return(
+        nep_evidence$evidence[k[1]]
+      )
+    }
 
 
     # Sandeel assessment areas are not ordinary ICES_Area stock
-    # boundaries in this workflow.
-    #
-    # Preserve the baseline behaviour: keep locations in 27.3/27.4
-    # as review candidates rather than claiming a unique assignment.
+    # boundaries in this workflow. Keep the underlying broad-area
+    # geographic evidence here; the review override is applied below.
 
     if (
       startsWith(
@@ -2515,22 +2521,14 @@ rules$evidence <- vapply(
       )
     ) {
 
-      z <- classify_area_set(
-        loc_areas,
-        c(
-          "27.3",
-          "27.4"
-        )
-      )
-
       return(
-        if (
-          z == "outside"
-        ) {
-          "outside"
-        } else {
-          "review"
-        }
+        classify_area_set(
+          loc_areas,
+          c(
+            "27.3",
+            "27.4"
+          )
+        )
       )
     }
 
@@ -2585,26 +2583,98 @@ rules$evidence <- vapply(
     }
 
 
-    z <- classify_area_set(
-      loc_areas,
-      stock_area_lists[[s]]
-    )
-
+    # Ordinary stocks normally use the resolved location areas above.
+    #
+    # A rectangle/CLarea disagreement does not automatically imply uncertainty
+    # about stock membership. For these conflicts, compare each geographic
+    # source independently with the candidate stock:
+    #
+    #   - if both sources imply the same stock-level evidence, retain it;
+    #   - if the stock-level conclusions differ, keep the evidence unknown.
+    #
+    # This does not choose one geographic source over the other. The underlying
+    # geography_status remains "rectangle_CLarea_conflict" for auditing.
+    geo_status <- geography_status_by_geo[[gid]]
 
     if (
-      z != "outside" &&
-      s %in%
-      needs_review
+      !is.na(geo_status) &&
+      geo_status == "rectangle_CLarea_conflict"
     ) {
 
-      z <- "review"
+      stock_codes <- stock_area_lists[[s]]
+
+      reported_evidence <- classify_area_set(
+        reported_area,
+        stock_codes
+      )
+
+      mapped_areas <- if (
+        !is.na(rec) &&
+        rec %in%
+          names(
+            rect_area_lists
+          )
+      ) {
+
+        unique(
+          rect_area_lists[[rec]]
+        )
+
+      } else {
+
+        character()
+      }
+
+      rectangle_evidence <- classify_area_set(
+        mapped_areas,
+        stock_codes
+      )
+
+      if (
+        identical(
+          reported_evidence,
+          rectangle_evidence
+        )
+      ) {
+
+        return(
+          reported_evidence
+        )
+      }
+
+      return("unknown")
     }
 
 
-    z
+    classify_area_set(
+      loc_areas,
+      stock_area_lists[[s]]
+    )
   },
   character(1)
 )
+
+
+# Final evidence starts from the geographic evidence above. Keep raw_evidence
+# unchanged for diagnostics, then apply the conservative review policy.
+rules$evidence <- rules$raw_evidence
+
+
+review_rows <-
+  rules$evidence != "outside" &
+  (
+    rules$fishstock %in%
+      needs_review |
+    startsWith(
+      rules$fishstock,
+      "san.sa."
+    )
+  )
+
+
+rules$evidence[
+  review_rows
+] <- "review"
 
 
 candidates <- dat |>
@@ -2959,8 +3029,10 @@ writeLines(
     ),
 
     paste(
-      "If rectangle and CLarea conflict, the location is left",
-      "geographically unresolved rather than guessed."
+      "If rectangle and CLarea conflict, the geographic conflict is retained",
+      "for audit. For ordinary stocks, each source is classified independently",
+      "against the stock: matching stock-level conclusions are retained, while",
+      "source-dependent conclusions remain unknown."
     ),
 
     paste(
