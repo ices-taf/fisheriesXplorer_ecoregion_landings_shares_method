@@ -24,5 +24,5 @@ analysis_years <- NULL
 rebuild_landings <- FALSE
 refresh_reference <- FALSE
 
-source("model_1_global_stock_matching_modified.R", local = FALSE)
+source("model_1_global_stock_matching_conflict_refined.R", local = FALSE)
 source("model_2_ecoregion_shares.R", local = FALSE)
