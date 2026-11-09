@@ -1,5 +1,9 @@
 /boot/data
-/boot/initial/data
+/boot/initial/data/RDBES Effort CE 2021 2025
+/boot/initial/data/RDBES Landings CL 2021 2025
+/boot/initial/data/ASFIS_sp_2025.csv
+/boot/initial/data/export_referentiel_stocks-scientifiques_20250327.xlsx
+/boot/initial/data/RDBES_especes_fao.csv
 /boot/library
 /boot/software
 /data
